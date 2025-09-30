@@ -3,10 +3,13 @@ import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { DatasusModule } from './datasus/datasus.module';
+import { HttpClientModule } from './axios/http-client.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    HttpClientModule,
     TypeOrmModule.forRootAsync({
       useFactory: () => ({
         type: 'postgres',
@@ -20,6 +23,7 @@ import { AppService } from './app.service';
         autoLoadEntities: true,
       }),
     }),
+    DatasusModule,
   ],
   controllers: [AppController],
   providers: [AppService],
