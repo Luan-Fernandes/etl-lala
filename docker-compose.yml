@@ -33,6 +33,36 @@ services:
       timeout: 5s
       retries: 5
 
+  etl_job:
+    build: .
+    container_name: etl_job
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      # Axios defaults mais altos para evitar timeout
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-600000}
+      HTTP_MAX_REDIRECTS: 5
+      # Bull/Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # DB para TypeORM (usa hostname interno do Compose)
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-etl_mult}
+      # Parâmetros ETL
+      ETL_MODE: ${ETL_MODE:-download-mensal}
+      ETL_TIPO_ARQUIVO: ${ETL_TIPO_ARQUIVO:-PA}
+      ETL_MODALIDADE: ${ETL_MODALIDADE:-1}
+      ETL_FONTE: ${ETL_FONTE:-SIASUS}
+      ETL_UF: ${ETL_UF:-PE}
+    command: ["node", "dist/scripts/run-etl.js"]
+
 volumes:
   postgres_data:
   redis_data:
