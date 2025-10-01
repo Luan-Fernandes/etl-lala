@@ -9,11 +9,6 @@ import AdmZip from 'adm-zip';
 import * as fs from 'fs';
 import * as path from 'path';
 
-function toArray<T>(value: T | T[] | undefined): T[] {
-    if (value === undefined || value === null) return [];
-    return Array.isArray(value) ? value : [value];
-}
-
 @Injectable()
 export class DatasusService {
     constructor(
@@ -25,14 +20,10 @@ export class DatasusService {
         }
     }
     private readonly logger = new Logger(DatasusService.name);
-    getCompetence(competence: string): Array<{ mes: string, ano: string }> {
-        if (typeof competence !== 'string' || !/^\d{2}-\d{4}$/.test(competence)) {
-            throw new Error('Competência deve estar no formato MM-YYYY');
-        }
+    getCompetence(): Array<{ mes: string, ano: string }> {
 
-        const [mesStr, anoStr] = competence.split('-');
-        const mes = parseInt(mesStr, 10);
-        const ano = parseInt(anoStr, 10);
+        const mes = (new Date().getMonth() + 1).toString().padStart(2, '0') as unknown as number;
+        const ano = new Date().getFullYear()
 
         if (isNaN(mes) || isNaN(ano) || mes < 1 || mes > 12) {
             throw new Error('Competência inválida');
@@ -57,27 +48,18 @@ export class DatasusService {
 
     async requestFtp(payload: SiasusArquivoDto): Promise<SiasusArquivoResponse | SiasusArquivoResponse[]> {
 
-        const normalized: Required<Pick<SiasusArquivoDto, 'tipo_arquivo' | 'modalidade' | 'fonte' | 'ano' | 'mes' | 'uf'>> = {
-            tipo_arquivo: toArray(payload.tipo_arquivo),
-            modalidade: toArray(payload.modalidade),
-            fonte: toArray(payload.fonte),
-            ano: toArray(payload.ano),
-            mes: toArray(payload.mes),
-            uf: toArray(payload.uf),
-        };
-
-        if (normalized.ano.length === 0 || normalized.mes.length === 0) {
+        if (!payload.ano || !payload.mes) {
             throw new Error('Competência inválida');
         }
 
         const form = new URLSearchParams();
 
-        for (const v of normalized.tipo_arquivo) form.append('tipo_arquivo[]', v);
-        for (const v of normalized.modalidade) form.append('modalidade[]', v);
-        for (const v of normalized.fonte) form.append('fonte[]', v);
-        for (const v of normalized.ano) form.append('ano[]', v);
-        for (const v of normalized.mes) form.append('mes[]', v);
-        for (const v of normalized.uf) form.append('uf[]', v);
+        for (const v of payload.tipo_arquivo) form.append('tipo_arquivo[]', v);
+        for (const v of payload.modalidade) form.append('modalidade[]', v);
+        for (const v of payload.fonte) form.append('fonte[]', v);
+        for (const v of payload.ano) form.append('ano[]', v);
+        for (const v of payload.mes) form.append('mes[]', v);
+        for (const v of payload.uf) form.append('uf[]', v);
 
         const headers: Record<string, string> = {
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -87,7 +69,7 @@ export class DatasusService {
         };
 
         try {
-            this.logger.log(`POST ftp.php - payload: tipo_arquivo=${normalized.tipo_arquivo.join(',')}, modalidade=${normalized.modalidade.join(',')}, fonte=${normalized.fonte.join(',')}, ano=${normalized.ano.join(',')}, mes=${normalized.mes.join(',')}, uf=${normalized.uf.join(',')}`);
+            this.logger.log(`POST ftp.php - payload: tipo_arquivo=${payload.tipo_arquivo.join(',')}, modalidade=${payload.modalidade.join(',')}, fonte=${payload.fonte.join(',')}, ano=${payload.ano.join(',')}, mes=${payload.mes.join(',')}, uf=${payload.uf.join(',')}`);
             const { data } = await firstValueFrom(
                 this.httpService.post(
                     'https://datasus.saude.gov.br/wp-content/ftp.php',
@@ -95,8 +77,7 @@ export class DatasusService {
                     { headers },
                 ),
             );
-            const count = Array.isArray(data) ? data.length : (data ? 1 : 0);
-           count > 0 ? this.logger.log(`ftp.php OK - itens retornados: ${count}`) : this.logger.warn(`ftp.php OK - itens retornados: ${count}`);
+            data.length ? this.logger.log(`ftp.php OK - itens retornados: ${data.length}`) : this.logger.warn(`ftp.php OK - itens retornados: ${data.length}`);
             return data;
         } catch (e: any) {
             const status = e?.response?.status;
@@ -107,8 +88,7 @@ export class DatasusService {
     }
 
     async multReuestFtp(dados: Omit<SiasusArquivoDto, 'ano' | 'mes'>): Promise<SiasusArquivoResponse[]> {
-        const dataAtual = `${(new Date().getMonth() + 1).toString().padStart(2, '0')}-${new Date().getFullYear()}`;
-        const competencias = this.getCompetence(dataAtual);
+        const competencias = this.getCompetence();
 
         this.logger.log(`Enfileirando FTP por mês para ${competencias.length} competências...`);
         const jobs = await Promise.all(
@@ -171,7 +151,6 @@ export class DatasusService {
                 this.logger.log(`Link extraído (obj.link): ${link}`);
                 return link;
             }
-            // Último recurso: procurar string http(s)
             const asText = typeof data === 'string' ? data : JSON.stringify(data);
             const match = asText.match(/https?:[^"\s\]]+\.zip/);
             if (match && match[0]) { this.logger.log(`Link extraído (regex): ${match[0]}`); return match[0]; }
@@ -192,8 +171,7 @@ export class DatasusService {
     }
 
     async downloadLinksPorMes(dados: Omit<SiasusArquivoDto, 'ano' | 'mes'>): Promise<string[]> {
-        const dataAtual = `${(new Date().getMonth() + 1).toString().padStart(2, '0')}-${new Date().getFullYear()}`;
-        const competencias = this.getCompetence(dataAtual);
+        const competencias = this.getCompetence();
         const links: string[] = [];
 
         for (const c of competencias) {
@@ -201,7 +179,6 @@ export class DatasusService {
             const ftpJob = await this.datasusQueue.add('ftpByMonth', { dados, competence: c });
             const items = await ftpJob.finished() as SiasusArquivoResponse[];
             if (!items || items.length === 0) continue;
-            // baixar diretamente
             const link = await this.downloadFromItems(items);
             if (link) { links.push(link); this.logger.log(`Link capturado (${c.mes}-${c.ano}): ${link}`)
             }
@@ -220,26 +197,13 @@ export class DatasusService {
         return this.downloadLinksPorMes(dados);
     }
 
-    async baixarEExtrairDbc(links: string[], outDir = '/data'): Promise<string[]> {
-        if (!fs.existsSync(outDir)) {
-            fs.mkdirSync(outDir, { recursive: true });
+    extractDbc(zip: AdmZip): { name: string; data: Buffer }[] {
+        const entries = zip.getEntries();
+        const dbcs: { name: string; data: Buffer }[] = [];
+        for (const entry of entries) {
+            if (!entry.entryName.toLowerCase().endsWith('.dbc')) continue;
+            dbcs.push({ name: path.basename(entry.entryName), data: entry.getData() });
         }
-        const extraidos: string[] = [];
-        for (const link of links) {
-            this.logger.log(`Baixando ZIP: ${link}`);
-            const { data } = await firstValueFrom(
-                this.httpService.get(link, { responseType: 'arraybuffer' as any })
-            );
-            const zip = new AdmZip(Buffer.from(data as ArrayBuffer));
-            const entries = zip.getEntries();
-            for (const entry of entries) {
-                if (!entry.entryName.toLowerCase().endsWith('.dbc')) continue;
-                const dest = path.join(outDir, path.basename(entry.entryName));
-                fs.writeFileSync(dest, entry.getData());
-                extraidos.push(dest);
-                this.logger.log(`Extraído: ${dest}`);
-            }
-        }
-        return extraidos;
+        return dbcs;
     }
 }

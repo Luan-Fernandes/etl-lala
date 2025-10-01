@@ -8,8 +8,7 @@ async function run() {
   });
   try {
     const service = app.get(DatasusService);
-
-    // Executa sempre o fluxo padrão (12 links por mês) sem precisar de env/parâmetros
+        
     const links = await service.downloadLinksPorMesPadrao();
     links.forEach(link => {
       console.log(link);
