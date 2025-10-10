@@ -41,10 +41,19 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # ⚡ LIMITES DE MEMÓRIA - Ajuste conforme necessário
+    mem_limit: 3g
+    memswap_limit: 3g  # Desabilita swap (memswap = mem_limit)
     environment:
       NODE_ENV: production
-      # Axios defaults mais altos para evitar timeout
-      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-600000}
+      # ⚡ Configurações de memória Node.js
+      NODE_OPTIONS: "--expose-gc --max-old-space-size=2048"
+      # API de processamento DBC -> PostgreSQL
+      CONVERTER_API_URL: ${CONVERTER_API_URL:-http://host.docker.internal:5000/processar}
+      # Axios timeout: 30 minutos (processamento DBC é muito lento)
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-1800000}
       HTTP_MAX_REDIRECTS: 5
       # Bull/Redis
       REDIS_HOST: redis
@@ -61,7 +70,7 @@ services:
       ETL_MODALIDADE: ${ETL_MODALIDADE:-1}
       ETL_FONTE: ${ETL_FONTE:-SIASUS}
       ETL_UF: ${ETL_UF:-PE}
-    command: ["node", "dist/scripts/run-etl.js"]
+    command: ["node", "--expose-gc", "--max-old-space-size=2048", "dist/scripts/run-etl.js"]
 
 volumes:
   postgres_data:

@@ -1,13 +1,63 @@
 import { HttpService } from '@nestjs/axios';
 import { Injectable, Logger } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
-import {  SiasusArquivoDto, SiasusArquivoResponse } from './siasus-arquivo.type';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
-import { SiasusArquivoType, FonteType, UFType } from './siasus-arquivo.type';
-import AdmZip from 'adm-zip';
-import * as fs from 'fs';
+import * as AdmZip from 'adm-zip';
 import * as path from 'path';
+import * as FormData from 'form-data';
+import * as fs from 'fs';
+import * as os from 'os';
+import { FonteType, SiasusArquivoDto, SiasusArquivoResponse, SiasusArquivoType, UFType } from './datasus-arquivo.type';
+import { ObjectDados } from './datasus-object-processor';
+
+// Interface para resposta da API /processar (insere no PostgreSQL)
+export interface DbcProcessarResponse {
+    sucesso: boolean;
+    mensagem: string;
+    arquivo: {
+        nome: string;
+        arquivo_origem: string;
+        fonte: string;
+    };
+    metadados: {
+        tipo_arquivo: string;
+        estado: string;
+        competencia: string;
+    };
+    tabela: {
+        nome: string;
+        criada_agora: boolean;
+        total_registros: number;
+        total_colunas: number;
+        competencias_existentes: string[];
+    };
+    processamento: {
+        registros_lidos: number;
+        registros_inseridos: number;
+    };
+}
+
+export interface DbcProcessarErrorResponse {
+    sucesso: false;
+    mensagem: string;
+    erro?: string;
+    tipo_erro?: string;
+    detalhes?: string;
+}
+
+// Interface para metadados do processamento (usado internamente)
+export interface DbcArquivoProcessado {
+    arquivo_original: string;
+    fonte: string;
+    tabela_nome: string;
+    total_registros: number;
+    total_colunas: number;
+    tipo_arquivo: string;
+    estado: string;
+    competencia: string;
+    registros_inseridos: number;
+}
 
 @Injectable()
 export class DatasusService {
@@ -43,9 +93,8 @@ export class DatasusService {
             data.setMonth(data.getMonth() - 1);
         }
         this.logger.log(`Competências geradas: ${competencias.map(c => `${c.mes}-${c.ano}`).join(', ')}`);
-        return competencias;
+        return [{ mes: "01", ano: "2025" }, { mes:"02", ano: "2025"}];
     }
-
     async requestFtp(payload: SiasusArquivoDto): Promise<SiasusArquivoResponse | SiasusArquivoResponse[]> {
 
         if (!payload.ano || !payload.mes) {
@@ -187,23 +236,332 @@ export class DatasusService {
         return links;
     }
 
-    async downloadLinksPorMesPadrao(): Promise<string[]> {
+    async downloadLinksPorMesPadrao(): Promise<{ links: string[]; fonte: string }> {
         const dados: Omit<SiasusArquivoDto, 'ano' | 'mes'> = {
-            tipo_arquivo: [SiasusArquivoType.PA, SiasusArquivoType.AB, SiasusArquivoType.ABO, SiasusArquivoType.ACF, SiasusArquivoType.AD, SiasusArquivoType.AM, SiasusArquivoType.AN, SiasusArquivoType.AQ, SiasusArquivoType.AR, SiasusArquivoType.ATD, SiasusArquivoType.SAD],
+            tipo_arquivo: [SiasusArquivoType.PA], // ⚡ Reduzido para teste - depois adicione mais tipos
             modalidade: ["1"],
             fonte: [FonteType.SIASUS],
             uf: [UFType.PE],
-        };
-        return this.downloadLinksPorMes(dados);
+        }
+        const links = await this.downloadLinksPorMes(dados);
+        this.logger.log(`Total de links obtidos: ${links.length}`);
+        return { links, fonte: dados.fonte[0] };
     }
 
-    extractDbc(zip: AdmZip): { name: string; data: Buffer }[] {
-        const entries = zip.getEntries();
-        const dbcs: { name: string; data: Buffer }[] = [];
-        for (const entry of entries) {
-            if (!entry.entryName.toLowerCase().endsWith('.dbc')) continue;
-            dbcs.push({ name: path.basename(entry.entryName), data: entry.getData() });
+    async downloadZipFromUrl(url: string): Promise<Buffer> {
+        if (!url || !url.startsWith('http')) {
+            throw new Error(`URL inválida: ${url}`);
         }
-        return dbcs;
+
+        this.logger.log(`Baixando ZIP de ${url}...`);
+
+        const { data } = await firstValueFrom(
+            this.httpService.get(url, { 
+                responseType: 'arraybuffer',
+                maxContentLength: 500 * 1024 * 1024, // 500 MB max
+                timeout: 300000, // 5 minutos
+            }),
+        );
+
+        const zipBuffer = Buffer.from(data);
+        const tamanhoMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
+        this.logger.log(`Download concluído: ${tamanhoMB} MB`);
+        
+        // ⚡ Log de memória para debug
+        const memUsage = process.memoryUsage();
+        this.logger.log(`   📊 Memória: RSS=${(memUsage.rss / 1024 / 1024).toFixed(0)}MB | Heap=${(memUsage.heapUsed / 1024 / 1024).toFixed(0)}MB`);
+        
+        return zipBuffer;
+    }
+
+    async enviarZipParaEndpoint<T = any>(zipBuffer: Buffer, endpointUrl: string, nomeArquivo: string = 'arquivo.zip'): Promise<T> {
+        this.logger.log(`Enviando ZIP (${(zipBuffer.length / 1024 / 1024).toFixed(2)} MB) para ${endpointUrl}...`);
+        
+        const form = new FormData();
+        form.append('file', zipBuffer, {
+            filename: nomeArquivo,
+            contentType: 'application/zip',
+        });
+
+        try {
+            const { data } = await firstValueFrom(
+                this.httpService.post<T>(endpointUrl, form, {
+                    headers: {
+                        ...form.getHeaders(),
+                    },
+                    maxBodyLength: Infinity,
+                    maxContentLength: Infinity,
+                })
+            );
+
+            this.logger.log(`ZIP enviado com sucesso. Resposta recebida do endpoint.`);
+            return data;
+        } catch (error: any) {
+            const status = error?.response?.status;
+            const msg = error?.response?.data || error?.message || 'Erro desconhecido';
+            this.logger.error(`Erro ao enviar ZIP: ${JSON.stringify(msg)}`);
+            throw new Error(`Falha ao enviar ZIP para ${endpointUrl} (${status ?? 'sem status'}): ${JSON.stringify(msg)}`);
+        }
+    }
+
+    async enviarDbcParaEndpoint(dbcBuffer: Buffer, endpointUrl: string, nomeArquivo: string, fonte: string): Promise<DbcArquivoProcessado> {
+        const tamanhoDbcMB = (dbcBuffer.length / 1024 / 1024).toFixed(2);
+        this.logger.log(`📤 Enviando arquivo .dbc: ${nomeArquivo} (${tamanhoDbcMB} MB) para ${endpointUrl}...`);
+        
+        const form = new FormData();
+        
+        // Campo 'arquivo' - arquivo .dbc binário (obrigatório)
+        form.append('arquivo', dbcBuffer, {
+            filename: nomeArquivo,
+            contentType: 'application/octet-stream',
+        });
+
+        // Campo 'fonte' - fonte dos dados DATASUS (obrigatório)
+        form.append('fonte', fonte);
+        
+        // Campo 'arquivo_origem' - nome do arquivo sem extensão (opcional)
+        const nomeBase = nomeArquivo.replace(/\.[^/.]+$/, '');
+        form.append('arquivo_origem', nomeBase);
+
+        try {
+            const maxSize = 900 * 1024 * 1024; // 900 MB para envio de arquivos
+            
+            // Envia requisição POST para /processar
+            const { data } = await firstValueFrom(
+                this.httpService.post<DbcProcessarResponse>(endpointUrl, form, {
+                    headers: {
+                        ...form.getHeaders(),
+                    },
+                    maxBodyLength: maxSize,
+                    timeout: 1800000, // 30 minutos
+                })
+            );
+
+            // Valida resposta
+            if (!data.sucesso) {
+                throw new Error(data.mensagem || 'Erro desconhecido no processamento');
+            }
+            
+            // Log de sucesso
+            this.logger.log(`✅ ${nomeArquivo} processado com sucesso!`);
+            this.logger.log(`   📊 Tabela: ${data.tabela.nome}`);
+            this.logger.log(`   📝 Registros inseridos: ${data.processamento.registros_inseridos.toLocaleString('pt-BR')}`);
+            this.logger.log(`   📋 Colunas: ${data.tabela.total_colunas}`);
+            this.logger.log(`   🗂️  Competência: ${data.metadados.competencia}`);
+            this.logger.log(`   🆕 Tabela ${data.tabela.criada_agora ? 'criada agora' : 'já existia'}`);
+            
+            // Retorna metadados do processamento
+            return {
+                arquivo_original: data.arquivo.nome,
+                fonte: data.arquivo.fonte,
+                tabela_nome: data.tabela.nome,
+                total_registros: data.tabela.total_registros,
+                total_colunas: data.tabela.total_colunas,
+                tipo_arquivo: data.metadados.tipo_arquivo,
+                estado: data.metadados.estado,
+                competencia: data.metadados.competencia,
+                registros_inseridos: data.processamento.registros_inseridos,
+            };
+            
+        } catch (error: any) {
+            const status = error?.response?.status;
+            const errorData = error?.response?.data as DbcProcessarErrorResponse | undefined;
+            const errorMsg = error?.message || 'Erro desconhecido';
+            const errorCode = error?.code;
+            
+            // Log detalhado do erro
+            this.logger.error(`❌ Erro ao processar .dbc ${nomeArquivo}:`);
+            this.logger.error(`  - Endpoint: ${endpointUrl}`);
+            this.logger.error(`  - Status HTTP: ${status || 'N/A'}`);
+            this.logger.error(`  - Código: ${errorCode || 'N/A'}`);
+            this.logger.error(`  - Mensagem: ${errorMsg}`);
+            
+            if (errorData?.mensagem) {
+                this.logger.error(`  - Erro da API: ${errorData.mensagem}`);
+                if (errorData.erro) {
+                    this.logger.error(`  - Detalhe: ${errorData.erro}`);
+                }
+            }
+            
+            throw new Error(`Falha ao processar .dbc ${nomeArquivo} no endpoint ${endpointUrl} (HTTP ${status ?? 'N/A'}): ${errorMsg}`);
+        }
+    }
+
+    async extrairDbcDoZip(zipBuffer: Buffer): Promise<Array<{ nome: string; buffer: Buffer }>> {
+        this.logger.log(`Extraindo arquivos .dbc do ZIP...`);
+        
+        const zip = new AdmZip(zipBuffer);
+        const entries = zip.getEntries();
+        const arquivosDbc: Array<{ nome: string; buffer: Buffer }> = [];
+
+        for (const entry of entries) {
+            const nomeArquivo = entry.entryName.toLowerCase();
+            
+            // Filtrar apenas arquivos .dbc
+            if (nomeArquivo.endsWith('.dbc')) {
+                arquivosDbc.push({
+                    nome: path.basename(entry.entryName),
+                    buffer: entry.getData(),
+                });
+                
+                this.logger.log(`Arquivo .dbc encontrado: ${entry.entryName} (${(entry.header.size / 1024).toFixed(2)} KB)`);
+            }
+        }
+
+        this.logger.log(`Total de arquivos .dbc extraídos: ${arquivosDbc.length}`);
+        return arquivosDbc;
+    }
+
+    /**
+     * Extrai .dbc do ZIP e salva em disco temporário para economizar memória
+     */
+    async extrairDbcParaDisco(zipBuffer: Buffer): Promise<Array<{ nome: string; caminho: string }>> {
+        this.logger.log(`Extraindo arquivos .dbc do ZIP para disco temporário...`);
+        
+        const zip = new AdmZip(zipBuffer);
+        const entries = zip.getEntries();
+        const arquivosDbc: Array<{ nome: string; caminho: string }> = [];
+
+        // Criar diretório temporário único
+        const tempDir = path.join(os.tmpdir(), 'datasus-dbc-' + Date.now());
+        if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+        }
+
+        for (const entry of entries) {
+            const nomeArquivo = entry.entryName.toLowerCase();
+            
+            // Filtrar apenas arquivos .dbc
+            if (nomeArquivo.endsWith('.dbc')) {
+                const nomeBase = path.basename(entry.entryName);
+                const caminhoTemp = path.join(tempDir, nomeBase);
+                
+                // Salvar no disco
+                fs.writeFileSync(caminhoTemp, entry.getData());
+                
+                arquivosDbc.push({
+                    nome: nomeBase,
+                    caminho: caminhoTemp,
+                });
+                
+                const tamanhoMB = (entry.header.size / 1024 / 1024).toFixed(2);
+                this.logger.log(`Arquivo .dbc salvo: ${nomeBase} (${tamanhoMB} MB) → ${caminhoTemp}`);
+            }
+        }
+
+        this.logger.log(`Total de arquivos .dbc extraídos para disco: ${arquivosDbc.length}`);
+        return arquivosDbc;
+    }
+
+    /**
+     * Deleta um arquivo do disco
+     */
+    deletarArquivo(caminho: string): void {
+        try {
+            if (fs.existsSync(caminho)) {
+                fs.unlinkSync(caminho);
+                this.logger.log(`🗑️  Arquivo deletado: ${path.basename(caminho)}`);
+            }
+        } catch (error) {
+            this.logger.warn(`Erro ao deletar arquivo ${caminho}: ${error.message}`);
+        }
+    }
+
+    /**
+     * Deleta um diretório e seu conteúdo
+     */
+    deletarDiretorio(caminho: string): void {
+        try {
+            if (fs.existsSync(caminho)) {
+                fs.rmSync(caminho, { recursive: true, force: true });
+                this.logger.log(`🗑️  Diretório deletado: ${caminho}`);
+            }
+        } catch (error) {
+            this.logger.warn(`Erro ao deletar diretório ${caminho}: ${error.message}`);
+        }
+    }
+
+    async processarLinksPadrao(endpointUrl?: string): Promise<DbcArquivoProcessado[]> {
+        // Usa a variável de ambiente se não for fornecida (endpoint /processar)
+        const url = endpointUrl || process.env.CONVERTER_API_URL || 'http://host.docker.internal:5000/processar';
+        
+        this.logger.log(`📍 Usando endpoint: ${url}`);
+        
+        const { links, fonte } = await this.downloadLinksPorMesPadrao();
+        
+        this.logger.log(`Processando ${links.length} links...`);
+        
+        const todosOsMetadados: DbcArquivoProcessado[] = [];
+        let totalDbcCount = 0;
+
+        // ⚡ OTIMIZAÇÃO: Processar um ZIP por vez para economizar memória
+        for (let i = 0; i < links.length; i++) {
+            const link = links[i];
+            
+            this.logger.log(`\n📦 [${i + 1}/${links.length}] Processando ZIP: ${link}`);
+            
+            // 1️⃣ Baixar ZIP
+            this.logger.log(`   1/4 Baixando ZIP...`);
+            const zipBuffer = await this.downloadZipFromUrl(link);
+            
+            // 2️⃣ Extrair arquivos .dbc para DISCO (economiza memória)
+            this.logger.log(`   2/4 Extraindo .dbc para disco temporário...`);
+            const arquivosDbc = await this.extrairDbcParaDisco(zipBuffer);
+            
+            // ⚡ FORÇA COLETA DE LIXO (libera memória do ZIP)
+            const tamanhoZip = (zipBuffer.length / 1024 / 1024).toFixed(2);
+            if (global.gc) {
+                global.gc();
+                this.logger.log(`   🗑️  Garbage Collection forçado - ZIP liberado (${tamanhoZip} MB)`);
+            } else {
+                this.logger.log(`   💾 Buffer do ZIP será liberado pelo GC (${tamanhoZip} MB)`);
+            }
+            
+            // 3️⃣ Processar cada .dbc sequencialmente
+            this.logger.log(`   3/4 Processando ${arquivosDbc.length} arquivos .dbc...`);
+            
+            for (const dbc of arquivosDbc) {
+                totalDbcCount++;
+                
+                this.logger.log(`\n   📄 [DBC ${totalDbcCount}] ${dbc.nome}`);
+                
+                try {
+                    // Enfileirar o .dbc (passa o caminho do arquivo, não o buffer)
+                    const job = await this.datasusQueue.add('sendDbcFromDisk', {
+                        caminhoArquivo: dbc.caminho,
+                        nomeArquivo: dbc.nome,
+                        endpointUrl: url,
+                        index: totalDbcCount,
+                        zipOrigem: link,
+                        fonte: fonte,
+                    });
+                    
+                    // Aguardar processamento ANTES de continuar para o próximo
+                    const metadados = await job.finished() as DbcArquivoProcessado;
+                    todosOsMetadados.push(metadados);
+                    
+                    this.logger.log(`   ✅ Processado: ${metadados.registros_inseridos.toLocaleString('pt-BR')} registros → ${metadados.tabela_nome}`);
+                    
+                } catch (error) {
+                    this.logger.error(`   ❌ Erro ao processar ${dbc.nome}: ${error.message}`);
+                    
+                    // Mesmo com erro, deletar o arquivo
+                    this.deletarArquivo(dbc.caminho);
+                    throw error;
+                }
+            }
+            
+            // 4️⃣ Deletar diretório temporário do ZIP
+            if (arquivosDbc.length > 0) {
+                const dirTemp = path.dirname(arquivosDbc[0].caminho);
+                this.deletarDiretorio(dirTemp);
+            }
+            
+            this.logger.log(`   4/4 ZIP concluído! ${arquivosDbc.length} arquivos .dbc processados\n`);
+        }
+
+        this.logger.log(`\n✅ Processamento completo! ${todosOsMetadados.length} arquivos .dbc processados.`);
+        
+        return todosOsMetadados;
     }
 }

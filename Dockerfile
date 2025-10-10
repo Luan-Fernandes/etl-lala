@@ -14,9 +14,13 @@ RUN npm run build
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
+
+# ⚡ Configurações de memória Node.js
+ENV NODE_OPTIONS="--expose-gc --max-old-space-size=2048"
+
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package*.json ./
 
 # Comando padrão pode ser sobrescrito pelo docker-compose
-CMD ["node", "dist/main.js"]
+CMD ["node", "--expose-gc", "--max-old-space-size=2048", "dist/main.js"]
